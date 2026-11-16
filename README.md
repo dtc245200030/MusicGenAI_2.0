@@ -18,16 +18,40 @@ Hệ thống được cấu hình cho máy cá nhân, đặc biệt là NVIDIA R
 
 ## Kiến trúc
 
-```text
-Trình duyệt
-  └─ POST /api/generate
-       └─ FastAPI (server.py)
-            ├─ FLAN-T5 encoder: mã hóa prompt
-            ├─ Transformer decoder: sinh REMI token
-            ├─ MidiTok REMI: token -> MIDI
-            ├─ WAV preview thuần Python/Numpy
-            └─ JSON history + file MID/WAV
+```mermaid
+flowchart LR
+    U["Người dùng"] -->|"Nhập prompt"| UI["Web Chat<br/>HTML · CSS · JavaScript"]
+    UI -->|"POST /api/generate"| API["FastAPI Server<br/>server.py"]
+
+    subgraph INFERENCE["Pipeline suy luận"]
+        direction LR
+        T5["FLAN-T5 Encoder<br/>Mã hóa prompt"]
+        DEC["Transformer Decoder<br/>6 lớp · 8 heads"]
+        TOK["REMI Tokens<br/>Vocabulary 516"]
+        MIDI["MidiTok Decoder<br/>REMI → MIDI"]
+        T5 -->|"Text embedding"| DEC
+        DEC --> TOK
+        TOK --> MIDI
+    end
+
+    API -->|"Batch 1 · tuần tự"| T5
+    GPU["RTX 2050 4 GB<br/>CUDA · FP16"] -.->|"Tăng tốc suy luận"| T5
+    GPU -.-> DEC
+
+    MIDI --> MID["File MIDI gốc"]
+    MIDI --> SYNTH["NumPy Synthesizer<br/>Không đệm im lặng"]
+    SYNTH --> WAV["WAV Preview<br/>5–10 giây"]
+
+    MID --> STORE[("data/generated")]
+    WAV --> STORE
+    API <--> HISTORY[("data/history.json")]
+
+    STORE -->|"audio_url · midi_url"| API
+    API -->|"JSON response"| UI
+    UI --> PLAY["Nghe WAV<br/>Tải MIDI"]
 ```
+
+Luồng xử lý bắt đầu khi web chat gửi prompt tới API. FLAN-T5 biến văn bản thành embedding, Transformer Decoder sinh chuỗi token REMI, sau đó MidiTok giải mã thành MIDI. MIDI gốc được lưu để tải xuống, đồng thời NumPy tạo WAV preview dài 5–10 giây để phát ngay trên trình duyệt. Lịch sử và đường dẫn kết quả được lưu cục bộ dưới dạng JSON.
 
 Mô hình `TextToMidiTransformer` có cấu hình lấy trực tiếp từ checkpoint:
 
