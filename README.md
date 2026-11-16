@@ -1,6 +1,6 @@
 # MusicGen2.0
 
-MusicGen2.0 là hệ thống web chat tạo nhạc từ mô tả văn bản. Người dùng nhập một prompt, mô hình tạo chuỗi token nhạc, giải mã thành MIDI và dựng một bản WAV nhẹ để nghe ngay trên trình duyệt. File MIDI gốc có thể tải về để phối khí bằng DAW hoặc SoundFont.
+MusicGen2.0 là hệ thống web chat tạo nhạc từ mô tả văn bản. Người dùng nhập một prompt, mô hình tạo chuỗi token nhạc, giải mã thành MIDI và render WAV bằng FluidSynth + SoundFont để nghe ngay trên trình duyệt. File MIDI gốc vẫn có thể tải về để phối khí bằng DAW.
 
 Hệ thống được cấu hình cho máy cá nhân, đặc biệt là NVIDIA RTX 2050 Laptop GPU 4 GB VRAM: mô hình nạp theo nhu cầu, dùng FP16 trên CUDA, xử lý từng yêu cầu tuần tự và giới hạn độ dài sinh mặc định ở 256 token.
 
@@ -8,7 +8,7 @@ Hệ thống được cấu hình cho máy cá nhân, đặc biệt là NVIDIA R
 
 - Web chat responsive, có lịch sử hội thoại và tìm kiếm.
 - Sinh MIDI từ prompt tiếng Anh hoặc tiếng Việt.
-- Nghe WAV preview dài 5–10 giây và tải file `.mid`; WAV không được đệm im lặng.
+- Nghe WAV preview dài 5–10 giây bằng FluidSynth + `FluidR3 GM.sf2` và tải file `.mid`.
 - Lưu lịch sử cục bộ dưới dạng JSON, không cần cơ sở dữ liệu.
 - API FastAPI có tài liệu tự động tại `/docs`.
 - Tự chọn CUDA khi PyTorch nhận GPU; tự chuyển về CPU nếu không có CUDA.
@@ -39,7 +39,7 @@ flowchart LR
     GPU -.-> DEC
 
     MIDI --> MID["File MIDI gốc"]
-    MIDI --> SYNTH["NumPy Synthesizer<br/>Không đệm im lặng"]
+    MIDI --> SYNTH["FluidSynth 2.6.1<br/>FluidR3 GM SoundFont"]
     SYNTH --> WAV["WAV Preview<br/>5–10 giây"]
 
     MID --> STORE[("data/generated")]
@@ -51,7 +51,7 @@ flowchart LR
     UI --> PLAY["Nghe WAV<br/>Tải MIDI"]
 ```
 
-Luồng xử lý bắt đầu khi web chat gửi prompt tới API. FLAN-T5 biến văn bản thành embedding, Transformer Decoder sinh chuỗi token REMI, sau đó MidiTok giải mã thành MIDI. MIDI gốc được lưu để tải xuống, đồng thời NumPy tạo WAV preview dài 5–10 giây để phát ngay trên trình duyệt. Lịch sử và đường dẫn kết quả được lưu cục bộ dưới dạng JSON.
+Luồng xử lý bắt đầu khi web chat gửi prompt tới API. FLAN-T5 biến văn bản thành embedding, Transformer Decoder sinh chuỗi token REMI, sau đó MidiTok giải mã thành MIDI. MIDI gốc được lưu để tải xuống; FluidSynth dùng `FluidR3 GM.sf2` render WAV 44,1 kHz để phát trên trình duyệt. Motif ngắn được lặp đến tối thiểu 5 giây và kết quả dài được giới hạn ở 10 giây. Lịch sử và đường dẫn kết quả được lưu cục bộ dưới dạng JSON.
 
 Mô hình `TextToMidiTransformer` có cấu hình lấy trực tiếp từ checkpoint:
 
@@ -78,7 +78,9 @@ MusicGen2.0/
 │  ├─ best_text2midi_model.pt        # Checkpoint đã huấn luyện
 │  └─ midi_tokenizer_config.json     # Cấu hình REMI, vocab 516
 ├─ soundfonts/
-│  └─ FluidR3 GM.sf2                 # SoundFont để render ngoài hệ thống
+│  ├─ FluidR3 GM.sf2                 # SoundFont General MIDI dùng khi render
+│  └─ fluidsynth-v2.6.1-win10-x64-cpp11/
+│     └─ bin/fluidsynth.exe          # FluidSynth Windows x64 tích hợp
 ├─ static/
 │  ├─ index.html
 │  ├─ app.js
@@ -95,7 +97,8 @@ MusicGen2.0/
 - Khuyến nghị dùng `uv` để tái tạo đúng môi trường.
 - NVIDIA RTX 2050 4 GB hoặc GPU CUDA tương đương; vẫn chạy được bằng CPU nhưng rất chậm.
 - NVIDIA driver còn được hỗ trợ và PyTorch bản CUDA.
-- Khoảng 5 GB dung lượng trống cho môi trường, checkpoint và cache FLAN-T5.
+- FluidSynth Windows x64 và một SoundFont `.sf2` (đã có sẵn trong `soundfonts/`).
+- Khoảng 8 GB dung lượng trống cho môi trường CUDA, checkpoint và cache FLAN-T5.
 - RAM hệ thống khuyến nghị từ 16 GB.
 
 ## Cài đặt
@@ -110,13 +113,13 @@ uv sync
 
 Lệnh này tạo `.venv` và cài dependency theo `uv.lock`.
 
-### 2. Cài PyTorch có CUDA cho RTX 2050
+### 2. PyTorch CUDA cho RTX 2050
 
-Môi trường ban đầu có thể đang dùng PyTorch CPU. Gỡ bản đó và cài wheel CUDA phù hợp theo lệnh hiện hành trên trang **PyTorch – Get Started**. Ví dụ với kho wheel CUDA 12.8:
+`pyproject.toml` đã cấu hình nguồn wheel CUDA 12.8 và `uv.lock` đã khóa `torch 2.11.0+cu128`. Vì vậy `uv sync` sẽ cài đúng bản CUDA. Nếu môi trường cũ vẫn còn PyTorch CPU, đồng bộ lại:
 
 ```powershell
-uv pip uninstall torch
-uv pip install torch --index-url https://download.pytorch.org/whl/cu128
+$env:UV_CACHE_DIR = ".uv-cache"
+uv sync
 ```
 
 Không cần cài CUDA Toolkit riêng nếu dùng wheel chính thức; cần NVIDIA driver tương thích. Kiểm tra:
@@ -127,7 +130,24 @@ Không cần cài CUDA Toolkit riêng nếu dùng wheel chính thức; cần NVI
 
 Kết quả đúng phải có `True` và tên GPU NVIDIA. Nếu vẫn là `False`, kiểm tra driver bằng `nvidia-smi`, sau đó kiểm tra lại wheel PyTorch đã cài có hậu tố CUDA thay vì `+cpu`.
 
-### 3. FLAN-T5
+### 3. FluidSynth và SoundFont
+
+Dự án hiện dùng các file sau:
+
+```text
+soundfonts/FluidR3 GM.sf2
+soundfonts/fluidsynth-v2.6.1-win10-x64-cpp11/bin/fluidsynth.exe
+```
+
+Kiểm tra FluidSynth:
+
+```powershell
+& ".\soundfonts\fluidsynth-v2.6.1-win10-x64-cpp11\bin\fluidsynth.exe" --version
+```
+
+Server tự tìm binary theo mẫu `soundfonts/fluidsynth-*-win10-x64-cpp11/bin/fluidsynth.exe`. Nếu không tìm thấy FluidSynth hoặc SoundFont, hệ thống fallback sang bộ tạo sóng sin để vẫn có thể trả WAV.
+
+### 4. FLAN-T5
 
 Lần đầu nạp mô hình, Transformers cần các file cấu hình/tokenizer của `google/flan-t5-base` và sẽ lưu vào Hugging Face cache. Máy cần Internet ở lần chạy đầu. Checkpoint của dự án đã chứa trọng số encoder dùng cho suy luận, nhưng tokenizer vẫn phải có trong cache.
 
@@ -202,12 +222,14 @@ Sau khi sinh:
 - “Tải file MIDI” lấy kết quả MIDI để mở trong FL Studio, Ableton Live, Reaper hoặc DAW khác.
 - Sidebar lưu các phiên chat; nút xóa chỉ xóa chỉ mục lịch sử. File đã sinh vẫn nằm trong `data/generated/` để tránh mất dữ liệu ngoài ý muốn.
 
-WAV trên web là preview sóng sin nhẹ, không dùng SoundFont để hệ thống không phụ thuộc FluidSynth. Để có âm thanh nhạc cụ chất lượng cao, import MIDI vào DAW và dùng `soundfonts/FluidR3 GM.sf2`, hoặc render bằng FluidSynth:
+WAV trên web được render ở 44,1 kHz bằng FluidSynth và `soundfonts/FluidR3 GM.sf2`, nên program và kênh trống General MIDI được phát bằng nhạc cụ tương ứng. Đây vẫn là SoundFont GM; guitar distortion hoặc nhạc cụ chuyên dụng trong DAW có thể cho chất lượng tốt hơn.
 
-WAV giữ độ dài tự nhiên khi nằm trong khoảng 5–10 giây. Nếu kết quả ngắn hơn 5 giây, hệ thống tự sinh lại với nhiều token hơn; nếu dài hơn 10 giây, WAV được cắt và fade-out 30 ms. Hệ thống không chèn khoảng im lặng. File MIDI tải xuống vẫn giữ toàn bộ kết quả gốc.
+WAV giữ độ dài tự nhiên khi nằm trong khoảng 5–10 giây. Nếu kết quả ngắn hơn 5 giây, audio của motif được lặp đến đủ 5 giây; nếu dài hơn 10 giây, preview được cắt ở 10 giây. File MIDI tải xuống vẫn giữ kết quả gốc và không bị lặp ở bước hậu xử lý audio.
 
 ```powershell
-fluidsynth -ni "soundfonts\FluidR3 GM.sf2" "data\generated\TEN_FILE.mid" -F output.wav -r 44100
+& ".\soundfonts\fluidsynth-v2.6.1-win10-x64-cpp11\bin\fluidsynth.exe" `
+  -ni -F output.wav -r 44100 `
+  ".\soundfonts\FluidR3 GM.sf2" ".\data\generated\TEN_FILE.mid"
 ```
 
 ## API
@@ -218,7 +240,7 @@ fluidsynth -ni "soundfonts\FluidR3 GM.sf2" "data\generated\TEN_FILE.mid" -F outp
 GET /api/health
 ```
 
-Trả về trạng thái checkpoint, thiết bị, CUDA, GPU và việc model đã được nạp hay chưa.
+Trả về trạng thái checkpoint, thiết bị, CUDA, GPU, việc model đã được nạp, `audio_renderer` (`fluidsynth` hoặc `sine`) và tên SoundFont.
 
 ### Sinh nhạc
 
@@ -272,9 +294,13 @@ Kiểm tra Internet/proxy, chạy riêng lệnh tải tokenizer, hoặc sao ché
 
 Đây là hành vi dự kiến: server phải đọc checkpoint khoảng 724 MB, khởi tạo FLAN-T5 và chuyển model sang GPU. Những lần sau tái sử dụng model đã nạp.
 
-### WAV nghe như tiếng tổng hợp đơn giản
+### Health báo `audio_renderer: sine`
 
-Đó là preview cố ý nhẹ. MIDI mới là đầu ra chính; render lại bằng SoundFont/DAW để có nhạc cụ General MIDI đầy đủ.
+Server không tìm thấy `fluidsynth.exe` hoặc `FluidR3 GM.sf2`. Kiểm tra đúng cấu trúc thư mục ở phần cài đặt và chạy trực tiếp `fluidsynth.exe --version`. Sau khi sửa, khởi động lại server.
+
+### WAV chưa giống nhạc cụ trên Colab hoặc DAW
+
+FluidR3 GM là SoundFont General MIDI, không phải thư viện nhạc cụ chuyên sâu. Chất lượng còn phụ thuộc program do MIDI sinh ra và chính checkpoint. Có thể tải MIDI vào DAW rồi thay SoundFont/VST cho guitar, bass và trống chất lượng cao hơn.
 
 ### CPU chạy quá chậm
 
@@ -442,7 +468,8 @@ Invoke-RestMethod http://127.0.0.1:8000/api/health
 - Quá trình sinh autoregressive chưa có KV cache, nên thời gian tăng nhanh theo `max_steps`.
 - Một worker duy nhất được khuyến nghị vì mỗi worker giữ một bản model trong VRAM.
 - Lịch sử JSON phù hợp máy cá nhân, không dành cho ghi đồng thời quy mô lớn.
-- Preview WAV không thể hiện đúng nhạc cụ MIDI; SoundFont chỉ dành cho bước render chất lượng cao bên ngoài.
+- Preview WAV dùng FluidR3 GM nên bị giới hạn bởi chất lượng và bộ nhạc cụ General MIDI của SoundFont.
+- Motif ngắn được lặp ở WAV để đạt 5 giây; file MIDI gốc không được kéo dài.
 - Chất lượng phụ thuộc checkpoint và miền dữ liệu huấn luyện; prompt cụ thể thường ổn định hơn prompt quá ngắn.
 
 ## Bản quyền và mô hình
