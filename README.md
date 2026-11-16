@@ -284,16 +284,51 @@ Sinh autoregressive phải chạy decoder nhiều lần; CPU chỉ là fallback 
 
 > Phần này chỉ cần thiết khi muốn huấn luyện lại model. Để chạy web bằng checkpoint có sẵn trong `models/`, có thể bỏ qua toàn bộ phần này.
 >
-> **Lưu ý về mã nguồn hiện tại:** bản dự án này chưa chứa các script tải dữ liệu, tiền xử lý và huấn luyện. Các tên lệnh dưới đây mô tả pipeline cần có khi bổ sung training utilities; chúng không phải điều kiện để chạy web hiện tại.
+> Bốn file `download-midicaps.py`, `preprocess.py`, `data.py` và `train.py` được sử dụng trong **Google Colab** để tải dữ liệu, tiền xử lý và huấn luyện. Chúng không thuộc runtime web chạy trên máy cá nhân và không cần thiết cho inference bằng checkpoint có sẵn.
+
+### Môi trường Google Colab
+
+Tạo một notebook Colab, chọn **Runtime → Change runtime type → T4 GPU**, sau đó tải bốn script lên Colab hoặc đặt chúng trong Google Drive. Nên lưu dataset, token đã xử lý và checkpoint trong Drive để dữ liệu không mất khi phiên Colab bị ngắt.
+
+Mount Google Drive:
+
+```python
+from google.colab import drive
+drive.mount("/content/drive")
+```
+
+Ví dụ cấu trúc thư mục làm việc:
+
+```text
+/content/drive/MyDrive/MusicGen2.0-training/
+├─ download-midicaps.py
+├─ preprocess.py
+├─ data.py
+├─ train.py
+├─ model.py
+├─ models/
+│  └─ midi_tokenizer_config.json
+├─ data/
+└─ checkpoints/
+```
+
+Di chuyển vào thư mục training và cài dependency cần thiết:
+
+```python
+%cd /content/drive/MyDrive/MusicGen2.0-training
+!pip install -q torch transformers sentencepiece miditok datasets
+```
+
+Các lệnh bắt đầu bằng `!` hoặc `%` dưới đây được chạy trong ô code của notebook Colab, không chạy trong PowerShell của web server.
 
 ### 1. Tải MIDICaps
 
 Dataset dùng để huấn luyện là [MIDICaps trên Hugging Face](https://huggingface.co/datasets/amaai-lab/MIDICaps), gồm các cặp mô tả văn bản và file MIDI tương ứng. Pipeline làm việc trực tiếp với sự kiện MIDI và caption.
 
-Khi đã có script tải dữ liệu:
+Chạy script tải dữ liệu trong một ô Colab:
 
-```powershell
-python download-midicaps.py
+```python
+!python download-midicaps.py
 ```
 
 Cấu trúc dữ liệu mong đợi:
@@ -310,8 +345,8 @@ Script tải cần giữ nguyên liên kết giữa caption, MIDI ID, đường 
 
 ### 2. Tiền xử lý MIDI
 
-```powershell
-python preprocess.py
+```python
+!python preprocess.py
 ```
 
 Quy trình tiền xử lý:
@@ -330,16 +365,16 @@ Nếu file token đã tồn tại, script có thể bỏ qua bước encode. Sau
 
 Kiểm tra Dataset và DataLoader:
 
-```powershell
-python data.py
+```python
+!python data.py
 ```
 
 Cần xác nhận MIDI tensor có shape `[batch, sequence]`, text tensor và attention mask khớp nhau, padding mask đúng vị trí, token ID không vượt quá 515 và caption đúng với file MIDI nguồn.
 
 ### 3. Huấn luyện Text-to-MIDI
 
-```powershell
-python train.py
+```python
+!python train.py
 ```
 
 Cấu hình tham khảo:
@@ -359,21 +394,29 @@ Cấu hình tham khảo:
 
 Trong mỗi batch, FLAN-T5 mã hóa caption thành text embedding. Transformer Decoder nhận chuỗi MIDI được dịch phải bằng BOS token và học dự đoán REMI token kế tiếp với causal attention. CFG prompt dropout tạo các mẫu không điều kiện để hỗ trợ Classifier-Free Guidance khi suy luận.
 
-Training nên sử dụng AMP trên CUDA, gradient clipping và theo dõi validation loss cùng top-1/top-5/top-10 token accuracy. Checkpoint tốt nhất được lưu tại:
+Training sử dụng AMP trên CUDA, gradient clipping và theo dõi validation loss cùng top-1/top-5/top-10 token accuracy. Checkpoint tốt nhất nên được ghi thẳng vào Google Drive:
 
 ```text
-models/best_text2midi_model.pt
+/content/drive/MyDrive/MusicGen2.0-training/checkpoints/best_text2midi_model.pt
 ```
 
 Checkpoint cần chứa `model_state_dict`, trạng thái optimizer và scheduler, epoch, validation metrics, lịch sử huấn luyện và `model_config`. `model_config` phải khớp kiến trúc server đang nạp: vocabulary 516, hidden size 512, 8 attention heads, 6 decoder layers và maximum sequence 1024.
 
-Thiết lập batch size 4 phù hợp hơn với GPU như Google Colab T4 15 GB. RTX 2050 4 GB chủ yếu phù hợp inference; nếu vẫn muốn training trên GPU này:
+Sau khi huấn luyện xong, tải checkpoint từ Google Drive về máy và chép/đổi tên thành:
+
+```text
+MusicGen2.0/models/best_text2midi_model.pt
+```
+
+Server đọc `model_config` từ checkpoint để dựng kiến trúc và dùng file này cho inference. Cấu hình tokenizer trên máy chạy web cũng phải giống tokenizer đã dùng trong Colab.
+
+Thiết lập batch size 4 được thiết kế cho Google Colab T4 15 GB. RTX 2050 4 GB của máy cá nhân chủ yếu dùng để inference; toàn bộ quá trình tải MIDICaps, tiền xử lý và training được thực hiện trên Colab. Nếu Colab vẫn hết VRAM:
 
 - Giảm batch size xuống 1.
 - Tăng gradient accumulation để giữ effective batch size.
 - Dùng AMP, gradient checkpointing và đóng băng FLAN-T5.
 - Giảm `max_seq_len`, số layer hoặc hidden size nếu vẫn hết VRAM.
-- Không chạy web inference đồng thời với training.
+- Khởi động lại Colab runtime nếu bộ nhớ GPU không được giải phóng sau lỗi.
 
 ## Kiểm tra nhanh
 
