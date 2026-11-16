@@ -1,0 +1,7 @@
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+data/generated/
+data/history.json
+.idea/
