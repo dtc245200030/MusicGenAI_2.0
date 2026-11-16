@@ -1,7 +1,7 @@
 """MusicGen2.0 API: text prompt -> MIDI -> lightweight WAV preview."""
 from __future__ import annotations
 
-import json, math, os, threading, time, uuid, wave
+import json, math, os, subprocess, threading, time, uuid, wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +20,9 @@ STATIC_DIR, MODEL_DIR, DATA_DIR = ROOT / "static", ROOT / "models", ROOT / "data
 OUTPUT_DIR, HISTORY_FILE = DATA_DIR / "generated", DATA_DIR / "history.json"
 CHECKPOINT = MODEL_DIR / "best_text2midi_model.pt"
 TOKENIZER_CONFIG = MODEL_DIR / "midi_tokenizer_config.json"
+SOUNDFONT_DIR = ROOT / "soundfonts"
+SOUNDFONT = SOUNDFONT_DIR / "FluidR3 GM.sf2"
+FLUIDSYNTH = next(SOUNDFONT_DIR.glob("fluidsynth-*-win10-x64-cpp11/bin/fluidsynth.exe"), None)
 
 class GenerateRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=500)
@@ -102,25 +105,29 @@ def score_notes_in_seconds(score: Any):
                           int(note.pitch), int(note.velocity)))
     return notes
 
-def synthesize_preview(score: Any, path: Path, sample_rate=22050, max_duration=10.0):
-    """Tạo WAV 5–10 giây từ note thật, tuyệt đối không đệm im lặng."""
+def synthesize_sine_preview(score: Any, path: Path, sample_rate=22050, max_duration=10.0):
+    """Tạo WAV 5–10 giây; lặp motif ngắn thay vì đệm im lặng."""
     notes = score_notes_in_seconds(score)
     natural_duration = max((n[1] for n in notes), default=0.0)
-    if natural_duration < 5.0:
-        raise ValueError("Bản nhạc sinh ra ngắn hơn 5 giây")
-    duration = min(natural_duration, max_duration)
+    if natural_duration <= 0.0:
+        raise ValueError("MIDI sinh ra không có nốt nhạc")
+    duration = min(max(natural_duration, 5.0), max_duration)
     audio = np.zeros(max(1, int(duration * sample_rate)), dtype=np.float32)
-    for start, end, pitch, velocity in notes:
-        begin, finish = int(start * sample_rate), min(len(audio), int(end * sample_rate))
-        count = finish - begin
-        if count <= 0: continue
-        t = np.arange(count, dtype=np.float32) / sample_rate
-        env = np.ones(count, dtype=np.float32)
-        fade = min(count // 2, int(.015 * sample_rate))
-        if fade:
-            env[:fade] = np.linspace(0, 1, fade); env[-fade:] = np.linspace(1, 0, fade)
-        freq = 440 * 2 ** ((pitch - 69) / 12)
-        audio[begin:finish] += .12 * velocity / 127 * env * np.sin(2 * math.pi * freq * t)
+    repeat_count = max(1, math.ceil(duration / natural_duration))
+    for repeat_index in range(repeat_count):
+        offset = repeat_index * natural_duration
+        for start, end, pitch, velocity in notes:
+            begin = int((start + offset) * sample_rate)
+            finish = min(len(audio), int((end + offset) * sample_rate))
+            count = finish - begin
+            if count <= 0: continue
+            t = np.arange(count, dtype=np.float32) / sample_rate
+            env = np.ones(count, dtype=np.float32)
+            fade = min(count // 2, int(.015 * sample_rate))
+            if fade:
+                env[:fade] = np.linspace(0, 1, fade); env[-fade:] = np.linspace(1, 0, fade)
+            freq = 440 * 2 ** ((pitch - 69) / 12)
+            audio[begin:finish] += .12 * velocity / 127 * env * np.sin(2 * math.pi * freq * t)
     # Fade-out 30 ms khi phải cắt ở giây thứ 10, tránh click nhưng không thêm im lặng.
     if natural_duration > max_duration:
         fade = min(len(audio), int(.03 * sample_rate))
@@ -132,6 +139,38 @@ def synthesize_preview(score: Any, path: Path, sample_rate=22050, max_duration=1
         wav.writeframes((audio * 32767).astype("<i2").tobytes())
     return duration
 
+def normalize_preview_duration(path: Path, min_duration=5.0, max_duration=10.0):
+    """Lặp audio ngắn và cắt audio dài, giữ nguyên định dạng WAV của FluidSynth."""
+    with wave.open(str(path), "rb") as source:
+        params = source.getparams()
+        frames = source.readframes(source.getnframes())
+    frame_size = params.nchannels * params.sampwidth
+    frame_count = len(frames) // frame_size
+    if frame_count <= 0:
+        raise ValueError("FluidSynth không tạo ra dữ liệu âm thanh")
+    target_frames = min(max(frame_count, int(min_duration * params.framerate)),
+                        int(max_duration * params.framerate))
+    repeats = math.ceil(target_frames / frame_count)
+    frames = (frames * repeats)[:target_frames * frame_size]
+    with wave.open(str(path), "wb") as output:
+        output.setparams(params)
+        output.writeframes(frames)
+    return target_frames / params.framerate
+
+def synthesize_preview(score: Any, midi_path: Path, wav_path: Path):
+    """Render MIDI bằng FluidSynth/SoundFont; chỉ fallback sóng sin khi thiếu binary."""
+    if FLUIDSYNTH and FLUIDSYNTH.exists() and SOUNDFONT.exists():
+        result = subprocess.run(
+            [str(FLUIDSYNTH), "-ni", "-F", str(wav_path), "-r", "44100",
+             "-g", "0.7", str(SOUNDFONT), str(midi_path)],
+            cwd=ROOT, capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout).strip()
+            raise RuntimeError(f"FluidSynth lỗi: {message}")
+        return normalize_preview_duration(wav_path)
+    return synthesize_sine_preview(score, wav_path)
+
 @app.get("/")
 def index(): return FileResponse(STATIC_DIR / "index.html")
 
@@ -140,7 +179,9 @@ def health():
     return {"status":"ok", "checkpoint":CHECKPOINT.exists(), "tokenizer":TOKENIZER_CONFIG.exists(),
             "model_loaded":service.model is not None, "device":str(service.device),
             "gpu":torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-            "cuda":torch.version.cuda}
+            "cuda":torch.version.cuda,
+            "audio_renderer":"fluidsynth" if FLUIDSYNTH and FLUIDSYNTH.exists() else "sine",
+            "soundfont":SOUNDFONT.name if SOUNDFONT.exists() else None}
 
 @app.post("/api/generate")
 def generate(request: GenerateRequest):
@@ -149,17 +190,9 @@ def generate(request: GenerateRequest):
     item_id = uuid.uuid4().hex
     midi, wav = OUTPUT_DIR/f"{item_id}.mid", OUTPUT_DIR/f"{item_id}.wav"
     try:
-        attempts = sorted(set([request.max_steps, max(request.max_steps, 384), 512]))
         actual_steps = request.max_steps
-        for actual_steps in attempts:
-            attempt_request = request.model_copy(update={"max_steps": actual_steps})
-            score = service.generate(attempt_request, midi)
-            notes = score_notes_in_seconds(score)
-            if max((note[1] for note in notes), default=0.0) >= 5.0:
-                break
-        else:
-            raise ValueError("Không thể sinh tối thiểu 5 giây nhạc sau 3 lần thử")
-        duration = synthesize_preview(score, wav)
+        score = service.generate(request, midi)
+        duration = synthesize_preview(score, midi, wav)
     except torch.cuda.OutOfMemoryError as exc:
         torch.cuda.empty_cache()
         raise HTTPException(507, "GPU hết VRAM; hãy giảm MUSICGEN_MAX_STEPS.") from exc
@@ -173,7 +206,8 @@ def generate(request: GenerateRequest):
                    "created_at":now(), "messages":[]}
         sessions.append(session)
     metadata = {"mode":"model", "device":str(service.device), "max_steps":actual_steps,
-                "duration_policy":"natural_5_to_10_seconds_no_silence_padding"}
+                "duration_policy":"5_to_10_seconds_repeat_short_motif",
+                "audio_renderer":"fluidsynth" if FLUIDSYNTH and FLUIDSYNTH.exists() else "sine"}
     audio_url, midi_url = f"/generated/{item_id}.wav", f"/generated/{item_id}.mid"
     session["messages"] += [{"role":"user", "content":request.prompt, "created_at":now()},
                             {"role":"assistant", "audio_url":audio_url, "midi_url":midi_url,
