@@ -140,21 +140,41 @@ def synthesize_sine_preview(score: Any, path: Path, sample_rate=22050, max_durat
     return duration
 
 def normalize_preview_duration(path: Path, min_duration=5.0, max_duration=10.0):
-    """Lặp audio ngắn và cắt audio dài, giữ nguyên định dạng WAV của FluidSynth."""
+    """Bỏ khoảng lặng đầu, tăng âm lượng và đưa preview về khoảng 5–10 giây."""
     with wave.open(str(path), "rb") as source:
         params = source.getparams()
         frames = source.readframes(source.getnframes())
-    frame_size = params.nchannels * params.sampwidth
-    frame_count = len(frames) // frame_size
-    if frame_count <= 0:
+    if params.sampwidth != 2:
+        raise ValueError(f"WAV FluidSynth có sample width không hỗ trợ: {params.sampwidth}")
+    audio = np.frombuffer(frames, dtype="<i2").reshape(-1, params.nchannels)
+    if not audio.size:
         raise ValueError("FluidSynth không tạo ra dữ liệu âm thanh")
+
+    # Model đôi khi sinh nốt đầu tiên rất muộn. Cắt phần im lặng trước nốt thay vì
+    # lấy 10 giây đầu của file và vô tình trả về một WAV hoàn toàn không có tiếng.
+    level = np.max(np.abs(audio.astype(np.int32)), axis=1)
+    peak = int(level.max())
+    if peak <= 0:
+        raise ValueError("FluidSynth tạo ra WAV không có tín hiệu")
+    active = np.flatnonzero(level >= max(1, peak // 1000))
+    lead_in = int(0.05 * params.framerate)
+    start = max(0, int(active[0]) - lead_in)
+    end = min(len(audio), int(active[-1]) + lead_in + 1)
+    audio = audio[start:end].astype(np.float32)
+
+    # MIDI có velocity rất nhỏ vẫn phải nghe được trên trình duyệt.
+    peak = float(np.max(np.abs(audio)))
+    audio *= (0.9 * np.iinfo(np.int16).max) / peak
+    audio = np.clip(audio, np.iinfo(np.int16).min, np.iinfo(np.int16).max).astype("<i2")
+
+    frame_count = len(audio)
     target_frames = min(max(frame_count, int(min_duration * params.framerate)),
                         int(max_duration * params.framerate))
     repeats = math.ceil(target_frames / frame_count)
-    frames = (frames * repeats)[:target_frames * frame_size]
+    audio = np.tile(audio, (repeats, 1))[:target_frames]
     with wave.open(str(path), "wb") as output:
         output.setparams(params)
-        output.writeframes(frames)
+        output.writeframes(audio.tobytes())
     return target_frames / params.framerate
 
 def synthesize_preview(score: Any, midi_path: Path, wav_path: Path):
