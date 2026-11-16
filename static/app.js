@@ -102,16 +102,6 @@ function bindEvents() {
     if (e.target === dom.modalOverlay) modalResolve && modalResolve(false);
   });
 
-  // Example chips
-  document.querySelectorAll('.example-chip').forEach(chip => {
-    chip.addEventListener('click', () => {
-      dom.promptInput.value = chip.dataset.prompt;
-      adjustTextarea();
-      updateCharCount();
-      dom.promptInput.focus();
-    });
-  });
-
   // Search
   dom.searchInput.addEventListener('input', () => {
     state.searchQuery = dom.searchInput.value.trim().toLowerCase();

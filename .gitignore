@@ -5,3 +5,5 @@ __pycache__/
 data/generated/
 data/history.json
 .idea/
+server.stdout.log
+server.stderr.log
