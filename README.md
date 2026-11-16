@@ -300,30 +300,32 @@ drive.mount("/content/drive")
 Ví dụ cấu trúc thư mục làm việc:
 
 ```text
-/content/drive/MyDrive/MusicGen2.0-training/
+/content/drive/MyDrive/MusicGen/
 ├─ download-midicaps.py
 ├─ preprocess.py
 ├─ data.py
 ├─ train.py
 ├─ model.py
 ├─ models/
-│  └─ midi_tokenizer_config.json
-├─ data/
+├─ data_midicaps/
+│  ├─ midicaps.tar.gz
+│  └─ midi_files/
+├─ processed_data/
 └─ checkpoints/
 ```
 
 Di chuyển vào thư mục training và cài dependency cần thiết:
 
 ```python
-%cd /content/drive/MyDrive/MusicGen2.0-training
-!pip install -q torch transformers sentencepiece miditok datasets
+%cd /content/drive/MyDrive/MusicGen
+!pip install -q torch transformers sentencepiece miditok symusic datasets huggingface_hub tqdm matplotlib
 ```
 
 Các lệnh bắt đầu bằng `!` hoặc `%` dưới đây được chạy trong ô code của notebook Colab, không chạy trong PowerShell của web server.
 
 ### 1. Tải MIDICaps
 
-Dataset dùng để huấn luyện là [MIDICaps trên Hugging Face](https://huggingface.co/datasets/amaai-lab/MIDICaps), gồm các cặp mô tả văn bản và file MIDI tương ứng. Pipeline làm việc trực tiếp với sự kiện MIDI và caption.
+Dataset dùng để huấn luyện là [MidiCaps trên Hugging Face](https://huggingface.co/datasets/amaai-lab/MidiCaps), repo ID chính xác trong code là `amaai-lab/MidiCaps`. Script đọc split `train`, tải metadata bằng `datasets` và tải archive MIDI `midicaps.tar.gz` bằng `huggingface_hub`.
 
 Chạy script tải dữ liệu trong một ô Colab:
 
@@ -334,14 +336,12 @@ Chạy script tải dữ liệu trong một ô Colab:
 Cấu trúc dữ liệu mong đợi:
 
 ```text
-data/
-├─ midicaps/
-│  ├─ metadata/          # caption, ID, split và thuộc tính âm nhạc
-│  └─ midi/              # các file .mid/.midi
-└─ processed_tokens/     # REMI token sau tiền xử lý
+data_midicaps/
+├─ midicaps.tar.gz       # archive khoảng 1,2 GB từ Hugging Face
+└─ midi_files/           # archive được giải nén tại đây
 ```
 
-Script tải cần giữ nguyên liên kết giữa caption, MIDI ID, đường dẫn file và train/validation/test split. File đã tồn tại và hợp lệ nên được bỏ qua để quá trình tải có thể tiếp tục sau khi gián đoạn.
+`download-midicaps.py` dùng cột `location` để ghép đường dẫn MIDI và giữ các trường `caption`, `genre`, `mood`, `tempo`, `key` trong danh sách `valid_pairs`. `BASE_DIR` mặc định là `./data_midicaps`; khi chạy lâu dài trên Colab nên đổi trực tiếp biến này thành `/content/drive/MyDrive/MusicGen/data_midicaps`.
 
 ### 2. Tiền xử lý MIDI
 
@@ -354,14 +354,14 @@ Quy trình tiền xử lý:
 1. Đọc caption và file MIDI tương ứng từ MIDICaps.
 2. Kiểm tra MIDI có thể parse được, có track/note hợp lệ và không bị hỏng.
 3. Chuẩn hóa hoặc lọc các bản quá ngắn, quá dài hay không có note.
-4. Mã hóa MIDI bằng MidiTok `REMI` với `models/midi_tokenizer_config.json`.
+4. Tạo `TokenizerConfig` với 16 mức velocity, chord, tempo, program và một token stream cho program; sau đó mã hóa MIDI bằng MidiTok `REMI`.
 5. Giới hạn hoặc chia chuỗi theo `max_seq_len=1024` và thêm padding mask.
 6. Tokenize caption bằng `google/flan-t5-base`, tối đa 128 text token.
-7. Lưu MIDI token, text token, attention mask, metadata và split vào thư mục `data/processed_tokens/`.
+7. Lưu `text_ids` và `midi_ids` dạng `int32` cùng `midi_vocab_size` và `pad_token_id` vào `/content/drive/MyDrive/MusicGen/processed_data/midicaps_processed_{N}.pt`.
 
-Cấu hình REMI hiện tại hỗ trợ pitch, velocity, duration, tempo, time signature, chord, program và drum token. Vocabulary thực tế có 516 token và phải khớp với `midi_vocab_size` trong checkpoint.
+Cấu hình tokenizer được tạo bởi `preprocess.py` và lưu tại `/content/drive/MyDrive/MusicGen/processed_data/midi_tokenizer_config.json`. Với cấu hình/checkpoint hiện tại vocabulary có 516 token; tokenizer sinh ra trong Colab phải được chép về `models/midi_tokenizer_config.json` cùng checkpoint.
 
-Nếu file token đã tồn tại, script có thể bỏ qua bước encode. Sau khi thay đổi tokenizer, split, độ dài chuỗi hoặc logic lọc, cần xóa cache chỉ mục và tiền xử lý lại toàn bộ dữ liệu; không trộn token sinh bởi hai cấu hình REMI khác nhau.
+`SUBSET_SIZE` hiện là `10000`; đặt thành `None` để xử lý toàn bộ khoảng 168 nghìn mẫu. MIDI ngắn hơn 32 token hoặc parse lỗi bị bỏ qua. Script dùng `ProcessPoolExecutor` với `CPU count - 1` worker và hiện gom các mẫu hợp lệ trong RAM trước khi ghi một file `.pt`. Khi đổi tokenizer hoặc độ dài chuỗi, cần tiền xử lý lại; không trộn các file token sinh bởi cấu hình REMI khác nhau.
 
 Kiểm tra Dataset và DataLoader:
 
@@ -369,7 +369,7 @@ Kiểm tra Dataset và DataLoader:
 !python data.py
 ```
 
-Cần xác nhận MIDI tensor có shape `[batch, sequence]`, text tensor và attention mask khớp nhau, padding mask đúng vị trí, token ID không vượt quá 515 và caption đúng với file MIDI nguồn.
+`data.py` tìm tất cả file `midicaps_*.pt`, trộn cố định với seed 42 rồi chia 90% training và 10% validation. Collate function dynamic-pad text/MIDI và tạo `text_attention_mask`, `midi_padding_mask`. Lệnh kiểm tra dùng batch size 8, `num_workers=0` và in shape của batch đầu tiên.
 
 ### 3. Huấn luyện Text-to-MIDI
 
@@ -382,25 +382,31 @@ Cấu hình tham khảo:
 | Tham số | Giá trị tham khảo |
 |---|---:|
 | Batch size | 4 |
-| Gradient accumulation | 4 |
-| Effective batch size | 16 |
-| Epochs | 100 |
-| Learning rate | `1.5e-4` |
+| Gradient accumulation | 8 |
+| Effective batch size | 32 |
+| Epochs | 50 |
+| Learning rate | `2e-4` |
+| Minimum learning rate | `1e-6` |
 | Weight decay | `0.01` |
 | CFG prompt dropout | `0.2` |
-| Scheduler | Cosine Annealing Warm Restarts |
+| Scheduler | Cosine Annealing Warm Restarts, `T_0=15`, `T_mult=2` |
 | Maximum MIDI sequence | 1024 token |
 | Maximum text sequence | 128 token |
+| Early stopping patience | 5 epoch |
 
 Trong mỗi batch, FLAN-T5 mã hóa caption thành text embedding. Transformer Decoder nhận chuỗi MIDI được dịch phải bằng BOS token và học dự đoán REMI token kế tiếp với causal attention. CFG prompt dropout tạo các mẫu không điều kiện để hỗ trợ Classifier-Free Guidance khi suy luận.
 
-Training sử dụng AMP trên CUDA, gradient clipping và theo dõi validation loss cùng top-1/top-5/top-10 token accuracy. Checkpoint tốt nhất nên được ghi thẳng vào Google Drive:
+Training dùng gradient clipping với `max_norm=1.0`, CFG dropout, resume checkpoint, early stopping và theo dõi validation loss cùng top-1/top-5/top-10 token accuracy. **Phiên bản `train.py` hiện tại chưa dùng AMP/autocast hoặc GradScaler.** Checkpoint được ghi thẳng vào Google Drive:
 
 ```text
-/content/drive/MyDrive/MusicGen2.0-training/checkpoints/best_text2midi_model.pt
+/content/drive/MyDrive/MusicGen/checkpoints/best_text2midi_model.pt
 ```
 
+Ngoài checkpoint tốt nhất, script luôn lưu `last_text2midi_model.pt` để tiếp tục từ epoch gần nhất và ghi biểu đồ `training_curves.png` vào cùng thư mục.
+
 Checkpoint cần chứa `model_state_dict`, trạng thái optimizer và scheduler, epoch, validation metrics, lịch sử huấn luyện và `model_config`. `model_config` phải khớp kiến trúc server đang nạp: vocabulary 516, hidden size 512, 8 attention heads, 6 decoder layers và maximum sequence 1024.
+
+> **Chênh lệch cần lưu ý:** `TransformerDecoderLayer` trong `train.py` đang dùng giá trị mặc định `norm_first=False`, trong khi `model.py` của web đặt `norm_first=True`. Hai cấu hình có cùng shape trọng số nên checkpoint vẫn nạp được, nhưng thứ tự LayerNorm khi inference không giống lúc training. Trước lần huấn luyện tiếp theo nên thống nhất hai file về cùng một giá trị; không đổi tùy ý đối với checkpoint đã huấn luyện nếu chưa đánh giá lại chất lượng.
 
 Sau khi huấn luyện xong, tải checkpoint từ Google Drive về máy và chép/đổi tên thành:
 
@@ -414,7 +420,7 @@ Thiết lập batch size 4 được thiết kế cho Google Colab T4 15 GB. RTX 
 
 - Giảm batch size xuống 1.
 - Tăng gradient accumulation để giữ effective batch size.
-- Dùng AMP, gradient checkpointing và đóng băng FLAN-T5.
+- FLAN-T5 đã được đóng băng trong code. Muốn giảm thêm VRAM cần tự bổ sung AMP/autocast hoặc gradient checkpointing vì hai tính năng này chưa được cài đặt trong script hiện tại.
 - Giảm `max_seq_len`, số layer hoặc hidden size nếu vẫn hết VRAM.
 - Khởi động lại Colab runtime nếu bộ nhớ GPU không được giải phóng sau lỗi.
 
