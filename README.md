@@ -280,6 +280,119 @@ Kiểm tra Internet/proxy, chạy riêng lệnh tải tokenizer, hoặc sao ché
 
 Sinh autoregressive phải chạy decoder nhiều lần; CPU chỉ là fallback chức năng. Hãy cài đúng PyTorch CUDA và xác nhận `/api/health` trả về `device: cuda`.
 
+## Chuẩn bị dữ liệu và huấn luyện
+
+> Phần này chỉ cần thiết khi muốn huấn luyện lại model. Để chạy web bằng checkpoint có sẵn trong `models/`, có thể bỏ qua toàn bộ phần này.
+>
+> **Lưu ý về mã nguồn hiện tại:** bản dự án này chưa chứa `download-musiccaps.py`, `preprocess.py`, `data.py` và `train.py`. Các lệnh dưới đây mô tả pipeline huấn luyện MusicCaps cần có khi bổ sung bộ training utilities; chúng không phải điều kiện để chạy web Text-to-MIDI hiện tại.
+
+### 1. Tải MusicCaps từ Hugging Face
+
+Dataset sử dụng là [Google MusicCaps trên Hugging Face](https://huggingface.co/datasets/google/MusicCaps). MusicCaps cung cấp caption tiếng Anh giàu mô tả, YouTube ID, thời điểm bắt đầu đoạn nhạc và các nhãn khía cạnh âm nhạc. Dataset không phân phối trực tiếp toàn bộ audio; quá trình tải phải tuân thủ điều khoản của YouTube và một số video có thể đã bị xóa hoặc giới hạn theo khu vực.
+
+Khi đã có script tải dữ liệu:
+
+```powershell
+python download-musiccaps.py
+```
+
+Cấu trúc dữ liệu mong đợi:
+
+```text
+data/
+├─ musiccaps/
+│  ├─ metadata/          # caption, YouTube ID, start_s, aspect_list
+│  └─ audio/             # audio tải được từ các video còn khả dụng
+└─ processed_tokens/     # token EnCodec sau tiền xử lý
+```
+
+Script tải nên có khả năng:
+
+- Đọc split MusicCaps từ Hugging Face.
+- Kiểm tra file đã tồn tại để có thể tiếp tục lần tải trước.
+- Tải đoạn audio dựa trên YouTube ID và `start_s` thay vì tải toàn bộ video khi có thể.
+- Ghi log các video không còn tồn tại, private hoặc bị chặn theo khu vực.
+- Kiểm tra file đầu ra hợp lệ trước khi đánh dấu mẫu đã hoàn tất.
+- Giữ nguyên caption và metadata gốc để quá trình tiền xử lý có thể tái lập.
+
+Nếu dữ liệu đã được xử lý và chia sẻ nội bộ, có thể đặt trực tiếp vào `data/musiccaps/` rồi bỏ qua bước tải.
+
+### 2. Tiền xử lý
+
+```powershell
+python preprocess.py
+```
+
+Quy trình tiền xử lý dự kiến:
+
+1. Đọc caption, YouTube ID, `start_s` và `aspect_list` từ MusicCaps.
+2. Dùng caption tiếng Anh của MusicCaps làm prompt chính; có thể nối thêm các aspect âm nhạc sau khi chuẩn hóa.
+3. Đọc audio, chuyển về mono ở 24 kHz.
+4. Lấy đoạn 10 giây tại vị trí `start_s` của dataset.
+5. Loại bỏ hoặc báo lỗi mẫu ngắn thay vì âm thầm tạo dữ liệu sai. Nếu chọn zero-padding trong quá trình huấn luyện, padding phải được mask để model không học khoảng lặng như nội dung nhạc.
+6. Mã hóa bằng EnCodec 24 kHz ở 3 kbps thành 4 codebook token.
+7. Lưu từng mẫu vào `data/processed_tokens/{sample_id}.pt` cùng prompt, metadata và split.
+
+Nếu file token đã tồn tại, script có thể chỉ làm mới prompt/metadata mà không encode lại audio. Sau khi thay đổi dữ liệu, cách chia split hoặc logic lọc, cần xóa cache chỉ mục để dataset dựng lại:
+
+```powershell
+Remove-Item data\processed_tokens\split_index.pt
+```
+
+Kiểm tra Dataset và DataLoader trước khi huấn luyện:
+
+```powershell
+python data.py
+```
+
+Việc kiểm tra cần xác nhận ít nhất: tensor shape của 4 codebook, độ dài chuỗi, attention/padding mask, prompt tương ứng và số lượng mẫu trong từng split.
+
+### 3. Huấn luyện
+
+```powershell
+python train.py
+```
+
+Cấu hình tham khảo đặt ở đầu `train.py`:
+
+| Tham số | Giá trị tham khảo |
+|---|---:|
+| Batch size | 4 |
+| Gradient accumulation | 4 |
+| Effective batch size | 16 |
+| Epochs | 100 |
+| Learning rate | `1.5e-4` |
+| Weight decay | `0.01` |
+| CFG prompt dropout | `0.2` |
+| Scheduler | Cosine Annealing Warm Restarts |
+
+Training nên sử dụng AMP trên CUDA, gradient clipping và theo dõi validation loss cùng top-1/top-5/top-10 token accuracy. Checkpoint có validation loss tốt nhất được lưu tại:
+
+```text
+checkpoints/best_musicgen_model.pt
+```
+
+Checkpoint huấn luyện cần chứa tối thiểu:
+
+- Trọng số model.
+- Trạng thái optimizer và scheduler.
+- Epoch và best validation loss.
+- Lịch sử metric.
+- `model_config` đầy đủ để server dựng đúng kiến trúc khi suy luận.
+- Cấu hình EnCodec/tokenizer tương ứng với dữ liệu đã tiền xử lý.
+
+Thiết lập trên phù hợp hơn với GPU Google Colab T4 15 GB, không phải RTX 2050 4 GB. Khi thiếu VRAM:
+
+- Giảm `BATCH_SIZE` xuống 1 hoặc 2.
+- Tăng `ACCUMULATION_STEPS` để giữ effective batch size.
+- Bật AMP và gradient checkpointing.
+- Giảm chiều ẩn, số layer hoặc độ dài chuỗi nếu vẫn thiếu bộ nhớ.
+- Không chạy web inference đồng thời với training trên cùng GPU.
+
+### Phân biệt hai pipeline
+
+Pipeline MusicCaps + EnCodec ở trên huấn luyện mô hình **text-to-audio token**. Checkpoint hiện có trong `models/best_text2midi_model.pt` là mô hình **text-to-MIDI REMI** và không thể thay thế trực tiếp bằng `best_musicgen_model.pt`. Muốn web nạp checkpoint audio mới, cần bổ sung lớp model tương ứng và bộ giải mã EnCodec trong server.
+
 ## Kiểm tra nhanh
 
 ```powershell
