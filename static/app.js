@@ -155,7 +155,7 @@ async function handleSend() {
     loadingEl.remove();
 
     if (!res.ok || data.status === 'error') {
-      appendError(data.error || 'Có lỗi xảy ra khi generate nhạc');
+      appendError(data.detail || data.error || 'Có lỗi xảy ra khi generate nhạc');
     } else {
       state.currentSessionId = data.session_id;
       appendAssistantMessage(data);
