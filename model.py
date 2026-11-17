@@ -159,6 +159,16 @@ class TextToMidiTransformer(nn.Module):
         device = next(self.parameters()).device
         B = len(text_list)
 
+        def per_sample(value, cast=float):
+            values = value if isinstance(value, (list, tuple)) else [value] * B
+            if len(values) != B:
+                raise ValueError(f"Sampling config must have {B} values, got {len(values)}")
+            return [cast(item) for item in values]
+
+        temperatures = torch.tensor(per_sample(temperature), device=device).unsqueeze(1).clamp_min(1e-5)
+        cfg_scales = torch.tensor(per_sample(cfg_scale), device=device).unsqueeze(1)
+        top_ks = per_sample(top_k, int)
+
         # Mã hóa đồng thời luồng có điều kiện (Cond) và không điều kiện (Uncond) cho CFG
         uncond_texts = [""] * B
         combined_text_embeds, combined_text_mask = self.text_conditioner.encode_texts(
@@ -169,6 +179,7 @@ class TextToMidiTransformer(nn.Module):
         # Khởi tạo chuỗi bằng BOS token: [B, 1]
         generated_tokens = torch.full((B, 1), self.bos_token_id, dtype=torch.long, device=device)
         max_pos = self.pos_embedding.shape[1]
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
 
         for _ in range(max_steps):
             seq_len = generated_tokens.shape[1]
@@ -191,22 +202,25 @@ class TextToMidiTransformer(nn.Module):
 
             # Áp dụng Classifier-Free Guidance (CFG)
             cond_logits, uncond_logits = next_logits.chunk(2, dim=0)
-            guided_logits = uncond_logits + cfg_scale * (cond_logits - uncond_logits)
-            guided_logits = guided_logits / max(temperature, 1e-5)
+            guided_logits = uncond_logits + cfg_scales * (cond_logits - uncond_logits)
+            guided_logits = guided_logits / temperatures
+
+            # PAD/BOS/MASK are never musical events. EOS (id 2) remains available.
+            guided_logits[:, [0, 1, 3]] = -float("Inf")
 
             # Top-K Sampling
-            if top_k > 0:
-                v, _ = torch.topk(guided_logits, min(top_k, guided_logits.size(-1)))
-                pivot = v[..., -1:]
-                guided_logits = torch.where(
-                    guided_logits < pivot,
-                    torch.tensor(-float("Inf"), device=device),
-                    guided_logits,
-                )
+            for row, k in enumerate(top_ks):
+                if k > 0:
+                    values, _ = torch.topk(guided_logits[row], min(k, guided_logits.size(-1)))
+                    guided_logits[row] = guided_logits[row].masked_fill(guided_logits[row] < values[-1], -float("Inf"))
 
             probs = torch.softmax(guided_logits, dim=-1)
             next_tokens = torch.multinomial(probs, num_samples=1)  # [B, 1]
+            next_tokens = torch.where(finished.unsqueeze(1), torch.zeros_like(next_tokens), next_tokens)
             generated_tokens = torch.cat([generated_tokens, next_tokens], dim=1)
+            finished |= next_tokens.squeeze(1).eq(2)
+            if bool(finished.all()):
+                break
 
         # Bỏ BOS token ở đầu và trả về [B, T]
         return generated_tokens[:, 1:]

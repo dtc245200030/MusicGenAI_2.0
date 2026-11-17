@@ -32,6 +32,8 @@ const dom = {
   modalCancel:    $('modalCancel'),
   modalConfirm:   $('modalConfirm'),
   toast:          $('toast'),
+  themeToggle:    $('themeToggle'),
+  themeLabel:     $('themeLabel'),
 };
 
 let modalResolve = null;
@@ -40,6 +42,7 @@ let modalResolve = null;
 // INIT
 // ═══════════════════════════════════════════════════════════════════
 document.addEventListener('DOMContentLoaded', () => {
+  initTheme();
   loadHistory();
   bindEvents();
   adjustTextarea();
@@ -62,6 +65,8 @@ async function checkServer() {
 // EVENT BINDING
 // ═══════════════════════════════════════════════════════════════════
 function bindEvents() {
+  dom.themeToggle.addEventListener('click', toggleTheme);
+  document.querySelectorAll('.prompt-card').forEach(card => card.addEventListener('click', () => selectPrompt(card)));
   // Send on Enter (Shift+Enter = new line)
   dom.promptInput.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -107,6 +112,35 @@ function bindEvents() {
     state.searchQuery = dom.searchInput.value.trim().toLowerCase();
     renderHistory();
   });
+}
+
+function initTheme() {
+  const saved = localStorage.getItem('musicgen-theme');
+  const preferred = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  applyTheme(saved || preferred);
+}
+
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  const isLight = theme === 'light';
+  dom.themeLabel.textContent = isLight ? 'Tối' : 'Sáng';
+  dom.themeToggle.setAttribute('aria-label', isLight ? 'Chuyển sang giao diện tối' : 'Chuyển sang giao diện sáng');
+}
+
+function toggleTheme() {
+  const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+  applyTheme(next);
+  localStorage.setItem('musicgen-theme', next);
+}
+
+function selectPrompt(card) {
+  document.querySelectorAll('.prompt-card').forEach(item => item.classList.remove('selected'));
+  card.classList.add('selected');
+  dom.promptInput.value = card.dataset.prompt;
+  adjustTextarea();
+  updateCharCount();
+  dom.promptInput.focus();
+  dom.promptInput.setSelectionRange(dom.promptInput.value.length, dom.promptInput.value.length);
 }
 
 // ═══════════════════════════════════════════════════════════════════
